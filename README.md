@@ -72,12 +72,14 @@ cxi-writer --validate-config \
 ### 3. Typical Workflow
 
 ```bash
-# Terminal 1: Start Q2 writer (waits for data)
-cxi-writer --config my_config.yaml
-
-# Terminal 2: Run PeakNet inference pipeline
+# Terminal 1: Run PeakNet inference pipeline (creates Q2 queue)
 peaknet-pipeline --config peaknet-socket-profile-673m-with-output.yaml
+
+# Terminal 2: Start Q2 writer (connects to Q2 and consumes data)
+cxi-writer --config my_config.yaml
 ```
+
+**Note**: While both launch orders work (due to ShardedQueueManager's create-or-connect behavior), launching the pipeline first is recommended as it follows the natural producer→consumer pattern.
 
 ## Configuration
 

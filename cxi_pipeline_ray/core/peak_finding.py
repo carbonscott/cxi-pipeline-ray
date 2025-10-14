@@ -12,7 +12,7 @@ import torch
 
 
 @ray.remote
-def process_samples_task(samples_ref, structure_ref):
+def process_samples_task(samples, structure):
     """
     Stateless Ray task for peak finding using scipy.ndimage.
 
@@ -21,23 +21,22 @@ def process_samples_task(samples_ref, structure_ref):
     calculation.
 
     Args:
-        samples_ref: ObjectRef to mini-batch of sample logits with shape (N, num_classes, H, W)
-        structure_ref: ObjectRef to shared 8-connectivity structure for ndimage.label
+        samples: Mini-batch of sample logits with shape (N, num_classes, H, W).
+                 Note: ObjectRefs are automatically dereferenced by Ray when passed
+                 as top-level arguments to remote functions.
+        structure: Shared 8-connectivity structure for ndimage.label (3x3 array).
+                   Auto-dereferenced from ObjectRef by Ray.
 
     Returns:
         List of peak positions for each sample: [[[p, y, x], ...], ...]
         where p is the sample/panel index, y and x are pixel coordinates.
 
     Note:
-        - Uses ObjectRefs for zero-copy data sharing
+        - Ray automatically dereferences ObjectRefs at function boundaries
         - Performs softmax + argmax to convert logits to binary segmentation
         - Uses scipy.ndimage.label for connected component labeling
         - Uses scipy.ndimage.center_of_mass for peak localization
     """
-    # Dereference from Ray object store
-    samples = ray.get(samples_ref)  # Mini-batch (e.g., 2-4 samples)
-    structure = ray.get(structure_ref)  # Shared structure
-
     all_peaks = []
 
     for sample_idx, sample_logits in enumerate(samples):
