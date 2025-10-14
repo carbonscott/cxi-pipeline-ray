@@ -1,0 +1,161 @@
+# CXI Pipeline Writer Configuration
+# Q2 Consumer: Inference Results → CXI Files
+#
+# This configuration file controls the Ray-based CPU post-processing pipeline
+# that consumes PeakNet inference results from Q2 and produces CXI files.
+#
+# IMPORTANT: The Ray namespace and queue settings MUST match the pipeline config
+# that produces data to Q2 (peaknet-socket-profile-673m-with-output.yaml)
+
+# ============================================================
+# Ray Configuration (MUST MATCH PIPELINE)
+# ============================================================
+ray:
+  # CRITICAL: Must match pipeline config exactly
+  # The writer must connect to the same Ray cluster namespace as the pipeline
+  namespace: "peaknet-pipeline"
+
+# ============================================================
+# Input Queue Configuration (MUST MATCH PIPELINE'S output_queue)
+# ============================================================
+queue:
+  # CRITICAL: Must match pipeline's runtime.queue_names.output_queue
+  name: "peaknet_q2"
+
+  # CRITICAL: Must match pipeline's runtime.queue_num_shards
+  num_shards: 8
+
+  # Should match pipeline for consistency
+  maxsize_per_shard: 1600
+
+  # How long to wait for data when polling (seconds)
+  # Lower = more responsive, Higher = less CPU overhead
+  poll_timeout: 0.01
+
+# ============================================================
+# CPU Post-Processing Configuration
+# ============================================================
+processing:
+  # Number of parallel Ray tasks for peak finding
+  # Tuning guide:
+  #   - Start with num_cpu_cores // 4 (conservative)
+  #   - Increase if CPU utilization is low
+  #   - Decrease if task scheduling overhead is high
+  num_cpu_workers: 16
+
+  # Maximum pending tasks (backpressure limit)
+  # Prevents OOM by limiting in-flight work
+  # Tuning guide:
+  #   - Lower (50): Less memory, may underutilize CPUs
+  #   - Higher (200): More memory, better throughput
+  #   - Default (100): Good balance
+  max_pending_tasks: 100
+
+# ============================================================
+# Peak Finding Configuration
+# ============================================================
+peak_finding:
+  # Minimum peaks required to save event (quality filter)
+  # Events with fewer peaks are filtered out
+  min_num_peak: 10
+
+  # Maximum peaks per event (CXI array size)
+  # Peaks beyond this limit are truncated
+  max_num_peak: 2048
+
+  # Connectivity for connected component labeling
+  # 8 = 8-connectivity (3x3 structure), 4 = 4-connectivity
+  connectivity: 8
+
+# ============================================================
+# Geometry and Coordinate Conversion
+# ============================================================
+geometry:
+  # CrystFEL geometry file for CheetahConverter
+  # Set to null or empty string to skip coordinate conversion
+  # Example: /sdf/data/lcls/ds/prj/prjcwang31/results/geometry/cxi_detector.geom
+  geom_file: null
+
+# ============================================================
+# CXI Output Configuration
+# ============================================================
+output:
+  # Directory for CXI files
+  # Will be created if create_output_dir is true
+  output_dir: "./cxi_output"
+
+  # Filename prefix
+  # Files will be named: {file_prefix}_{timestamp}_chunk{N:04d}.cxi
+  # Example: peaknet_cxi_20250113_120530_123456_chunk0001.cxi
+  file_prefix: "peaknet_cxi"
+
+  # Number of events to buffer before writing CXI file
+  # Tuning guide:
+  #   - Smaller (50): More files, faster flush, less memory
+  #   - Larger (200): Fewer files, slower flush, more memory
+  #   - Default (100): Good balance
+  buffer_size: 100
+
+  # Auto-create output directory if it doesn't exist
+  create_output_dir: true
+
+# ============================================================
+# System Configuration
+# ============================================================
+system:
+  # Logging level: DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"
+
+  # Optional: Path to log file (null = stdout only)
+  log_file: null
+
+  # Log progress every N batches
+  progress_interval: 50
+
+# ============================================================
+# Usage Examples
+# ============================================================
+#
+# Basic usage:
+#   cxi-writer --config examples/configs/cxi_writer_default.yaml
+#
+# With CLI overrides:
+#   cxi-writer --config cxi_writer.yaml \
+#     --num-cpu-workers 32 \
+#     --output-dir /custom/path \
+#     --geom-file /path/to/detector.geom
+#
+# Validate config consistency:
+#   cxi-writer --validate-config \
+#     --pipeline-config peaknet-socket-profile-673m-with-output.yaml \
+#     --writer-config cxi_writer.yaml
+#
+# ============================================================
+# Performance Tuning Notes
+# ============================================================
+#
+# If CPU utilization is low (<50%):
+#   - Increase num_cpu_workers
+#
+# If memory usage grows unbounded:
+#   - Decrease max_pending_tasks
+#   - Decrease buffer_size
+#
+# If Q2 queue is growing:
+#   - Writer is too slow, increase num_cpu_workers
+#   - Or check if peak finding is bottleneck
+#
+# If too many small CXI files:
+#   - Increase buffer_size
+#
+# ============================================================
+# Critical Settings Checklist
+# ============================================================
+#
+# Before running, verify:
+#   [ ] ray.namespace matches pipeline
+#   [ ] queue.name matches pipeline's output_queue
+#   [ ] queue.num_shards matches pipeline's queue_num_shards
+#   [ ] geometry.geom_file exists (if not null)
+#   [ ] output.output_dir is writable
+#   [ ] num_cpu_workers is reasonable for your node
