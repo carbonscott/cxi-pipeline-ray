@@ -142,7 +142,7 @@ Examples:
     parser.add_argument(
         '--geom-file',
         type=str,
-        help='Override geometry file path'
+        help='Geometry file for CrystFEL coordinate conversion. When provided, enables CrystFEL mode with additional LCLS datasets for downstream compatibility.'
     )
 
     parser.add_argument(

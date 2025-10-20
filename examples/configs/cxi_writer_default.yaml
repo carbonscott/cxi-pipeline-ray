@@ -68,11 +68,16 @@ peak_finding:
   connectivity: 8
 
 # ============================================================
-# Geometry and Coordinate Conversion
+# Geometry and Coordinate Conversion (CrystFEL Mode)
 # ============================================================
 geometry:
   # CrystFEL geometry file for CheetahConverter
-  # Set to null or empty string to skip coordinate conversion
+  # When set (not null/empty), enables CrystFEL mode:
+  #   - Required CheetahConverter initialization (strict mode)
+  #   - Adds /entry_1/result_1/peakTotalIntensity dataset (placeholder)
+  #   - Adds /LCLS/detector_1/EncoderValue dataset (from metadata or 0.0)
+  #   - Ensures all coordinates/images use Cheetah format
+  # Set to null to use default mode (graceful fallback if conversion fails)
   # Example: /sdf/data/lcls/ds/prj/prjcwang31/results/geometry/cxi_detector.geom
   geom_file: null
 

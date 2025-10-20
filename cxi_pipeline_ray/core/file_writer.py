@@ -33,7 +33,8 @@ class CXIFileWriterActor:
         buffer_size: int = 100,
         min_num_peak: int = 10,
         max_num_peak: int = 2048,
-        file_prefix: str = "peaknet_cxi"
+        file_prefix: str = "peaknet_cxi",
+        crystfel_mode: bool = False
     ):
         """
         Initialize CXI file writer with CheetahConverter.
@@ -45,6 +46,8 @@ class CXIFileWriterActor:
             min_num_peak: Minimum peaks required to save event
             max_num_peak: Maximum peaks per event (CXI array size)
             file_prefix: Prefix for CXI filenames
+            crystfel_mode: Enable strict CrystFEL mode (requires geom_file,
+                          adds LCLS datasets for downstream compatibility)
         """
         logging.basicConfig(level=logging.INFO)
 
@@ -55,6 +58,7 @@ class CXIFileWriterActor:
         self.min_num_peak = min_num_peak
         self.max_num_peak = max_num_peak
         self.file_prefix = file_prefix
+        self.crystfel_mode = crystfel_mode
 
         # Initialize CheetahConverter (expensive - done once per actor)
         self.cheetah_converter = None
@@ -72,10 +76,20 @@ class CXIFileWriterActor:
                 )[0].get('GEOM_BLOCK')
                 self.cheetah_converter = CheetahConverter(geom_block)
                 logging.info("CheetahConverter initialized successfully")
+
+                if self.crystfel_mode:
+                    logging.info("CrystFEL mode enabled - will include LCLS datasets")
             except Exception as e:
-                logging.warning(f"Failed to initialize CheetahConverter: {e}")
-                logging.warning("Will proceed without coordinate conversion")
-                self.use_cheetah = False
+                error_msg = f"Failed to initialize CheetahConverter: {e}"
+                if self.crystfel_mode:
+                    # In CrystFEL mode, CheetahConverter is required
+                    logging.error(error_msg)
+                    raise RuntimeError(f"CrystFEL mode requires valid geometry file. {error_msg}")
+                else:
+                    # In default mode, gracefully fall back
+                    logging.warning(error_msg)
+                    logging.warning("Will proceed without coordinate conversion")
+                    self.use_cheetah = False
 
         # State management
         self.buffer = []
@@ -178,6 +192,16 @@ class CXIFileWriterActor:
                     dtype='int'
                 )
 
+                # CrystFEL mode: Add peakTotalIntensity dataset
+                # Note: This is a placeholder - was never real data in old pipeline
+                if self.crystfel_mode:
+                    f.create_dataset(
+                        '/entry_1/result_1/peakTotalIntensity',
+                        (num_events, self.max_num_peak),
+                        dtype='float32',
+                        fillvalue=0.0
+                    )
+
                 # Extract photon energies from metadata
                 photon_energies = [
                     evt['metadata'].get('photon_energy', 0.0) if isinstance(evt['metadata'], dict) else 0.0
@@ -187,6 +211,17 @@ class CXIFileWriterActor:
                     '/LCLS/photon_energy_eV',
                     data=np.array(photon_energies, dtype='float32')
                 )
+
+                # CrystFEL mode: Add EncoderValue dataset
+                if self.crystfel_mode:
+                    encoder_values = [
+                        evt['metadata'].get('encoder_value', 0.0) if isinstance(evt['metadata'], dict) else 0.0
+                        for evt in self.buffer
+                    ]
+                    f.create_dataset(
+                        '/LCLS/detector_1/EncoderValue',
+                        data=np.array(encoder_values, dtype='float32')
+                    )
 
                 # Write events
                 for event_idx, evt in enumerate(self.buffer):

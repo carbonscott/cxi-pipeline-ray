@@ -68,6 +68,9 @@ def run_cpu_postprocessing_pipeline(
     logging.info(f"Output dir: {output_dir}")
     logging.info(f"Geometry file: {geom_file}")
 
+    # Determine if CrystFEL mode based on geometry file
+    crystfel_mode = geom_file is not None and geom_file != ""
+
     # Create file writer actor (stateful)
     file_writer = CXIFileWriterActor.remote(
         output_dir=output_dir,
@@ -75,7 +78,8 @@ def run_cpu_postprocessing_pipeline(
         buffer_size=buffer_size,
         min_num_peak=min_num_peak,
         max_num_peak=max_num_peak,
-        file_prefix=file_prefix
+        file_prefix=file_prefix,
+        crystfel_mode=crystfel_mode
     )
 
     # Create shared structure for all tasks (8-connectivity)
