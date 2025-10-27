@@ -68,6 +68,38 @@ peak_finding:
   connectivity: 8
 
 # ============================================================
+# Preprocessing Metadata Support (NEW - Cheetah/CrystFEL Integration)
+# ============================================================
+# The writer now supports detector image reconstruction when preprocessing
+# is done upstream (e.g., in lclstreamer).
+#
+# How it works:
+#   1. If PipelineOutput contains preprocessing_metadata:
+#      - Detector images are reconstructed: (B*C, 1, H, W) → (B, C, H_orig, W_orig)
+#      - Peaks are grouped by events using unpacking: b = idx // C, p = idx % C
+#      - Panel indices are preserved for CheetahConverter
+#
+#   2. Physics metadata conversion:
+#      - photon_wavelength (Å) → photon_energy (eV) via E = 12398.4193/λ
+#      - timestamp is extracted and written to /LCLS/detector_1/timestamp
+#
+#   3. Peak coordinates:
+#      - Used as-is (no transformation needed for bottom-right padding)
+#      - CheetahConverter handles panel-local → assembled detector conversion
+#
+#   4. Backward compatibility:
+#      - If no preprocessing_metadata, images used as-is
+#      - Falls back to original behavior for non-preprocessed data
+#
+# Data flow:
+#   lclstreamer (preprocessing) → Q1 → P → Q2
+#       ↓
+#   This writer: reconstruct detector images → find peaks → write CXI
+#
+# For details, see: PREPROCESSING-INTEGRATION.md and Q2-TO-W-HANDOFF.md
+#   in $PIPELINE_DEV_DIR
+
+# ============================================================
 # Geometry and Coordinate Conversion (CrystFEL Mode)
 # ============================================================
 geometry:
@@ -79,6 +111,9 @@ geometry:
   #   - Ensures all coordinates/images use Cheetah format
   # Set to null to use default mode (graceful fallback if conversion fails)
   # Example: /sdf/data/lcls/ds/prj/prjcwang31/results/geometry/cxi_detector.geom
+  #
+  # NOTE: CheetahConverter is REQUIRED when using preprocessing metadata
+  # to convert panel-local coordinates to assembled detector coordinates.
   geom_file: null
 
 # ============================================================

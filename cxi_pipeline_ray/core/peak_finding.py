@@ -28,14 +28,18 @@ def process_samples_task(samples, structure):
                    Auto-dereferenced from ObjectRef by Ray.
 
     Returns:
-        List of peak positions for each sample: [[[p, y, x], ...], ...]
-        where p is the sample/panel index, y and x are pixel coordinates.
+        List of peak positions per sample: [[[idx, y, x], ...], ...]
+        where idx is the sample index (local to this mini-batch).
+
+        NOTE: Event/panel grouping is done in coordinator.py using global indices,
+        not here with local mini-batch indices.
 
     Note:
         - Ray automatically dereferences ObjectRefs at function boundaries
         - Performs softmax + argmax to convert logits to binary segmentation
         - Uses scipy.ndimage.label for connected component labeling
         - Uses scipy.ndimage.center_of_mass for peak localization
+        - Matches OLD_CXI_DEV_DIR peak finding algorithm
     """
     all_peaks = []
 
@@ -61,8 +65,8 @@ def process_samples_task(samples, structure):
                 np.arange(1, num_peaks + 1)
             )
 
-            # Convert to [p, y, x] format (p = panel/sample index)
-            # Filter out invalid coordinates
+            # Convert to [sample_idx, y, x] format
+            # sample_idx is local to this mini-batch - coordinator will handle global grouping
             peaks = []
             for coords in peak_coords:
                 if isinstance(coords, tuple) and len(coords) == 2:

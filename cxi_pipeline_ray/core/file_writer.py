@@ -124,15 +124,26 @@ class CXIFileWriterActor:
             # Convert to Cheetah coordinates if converter available
             if self.use_cheetah and self.cheetah_converter is not None:
                 try:
+                    # Assemble multi-panel image: (C, H, W) → (H_assembled, W)
+                    # Use reduces_geom=True to match coordinate conversion (16 module-level panels)
+                    cheetah_image = self.cheetah_converter.convert_to_cheetah_img(img, reduces_geom=True)
+                    # Transform peak coordinates to assembled detector space
                     cheetah_peaks = self.cheetah_converter.convert_to_cheetah_coords(peaks)
-                    cheetah_image = self.cheetah_converter.convert_to_cheetah_img(img)
                 except Exception as e:
-                    logging.warning(f"CheetahConverter failed: {e}, using original coordinates")
+                    logging.warning(f"CheetahConverter failed: {e}, using manual assembly")
+                    # Fallback: manually stack panels vertically
+                    if len(img.shape) == 3:  # (C, H, W)
+                        cheetah_image = img.reshape(-1, img.shape[-1])  # Stack vertically
+                    else:
+                        cheetah_image = img
                     cheetah_peaks = peaks
-                    cheetah_image = img
             else:
+                # No CheetahConverter: manually assemble
+                if len(img.shape) == 3:  # (C, H, W)
+                    cheetah_image = img.reshape(-1, img.shape[-1])  # (C*H, W)
+                else:
+                    cheetah_image = img
                 cheetah_peaks = peaks
-                cheetah_image = img
 
             # Add to buffer
             self.buffer.append({
@@ -159,8 +170,9 @@ class CXIFileWriterActor:
             with h5py.File(filepath, 'w') as f:
                 num_events = len(self.buffer)
 
-                # Get shape from first event
+                # Get shape from first event (should be 2D assembled: H_assembled × W)
                 image_shape = self.buffer[0]['image'].shape
+                logging.debug(f"Writing CXI with image shape per event: {image_shape}")
 
                 # Create datasets
                 f.create_dataset(
@@ -202,18 +214,39 @@ class CXIFileWriterActor:
                         fillvalue=0.0
                     )
 
-                # Extract photon energies from metadata
-                photon_energies = [
-                    evt['metadata'].get('photon_energy', 0.0) if isinstance(evt['metadata'], dict) else 0.0
-                    for evt in self.buffer
-                ]
+                # Extract photon energies and timestamps from metadata
+                photon_energies = []
+                timestamps = []
+                for evt in self.buffer:
+                    meta = evt['metadata'] if isinstance(evt['metadata'], dict) else {}
+                    photon_energies.append(meta.get('photon_energy', 0.0))
+
+                    # Handle timestamp - could be scalar or array
+                    ts = meta.get('timestamp', 0.0)
+                    if isinstance(ts, np.ndarray):
+                        # Take first element if array
+                        timestamps.append(float(ts.flatten()[0]) if ts.size > 0 else 0.0)
+                    else:
+                        timestamps.append(float(ts))
+
+                # Create LCLS metadata datasets
                 f.create_dataset(
                     '/LCLS/photon_energy_eV',
                     data=np.array(photon_energies, dtype='float32')
                 )
 
-                # CrystFEL mode: Add EncoderValue dataset
+                # Add timestamp dataset if any non-zero timestamps exist
+                # Convert to array first to safely check
+                timestamps_array = np.array(timestamps, dtype='float32')
+                if np.any(timestamps_array != 0.0):
+                    f.create_dataset(
+                        '/LCLS/detector_1/timestamp',
+                        data=timestamps_array
+                    )
+
+                # CrystFEL mode or fallback: Add EncoderValue dataset
                 if self.crystfel_mode:
+                    # CrystFEL mode: Extract encoder values from metadata
                     encoder_values = [
                         evt['metadata'].get('encoder_value', 0.0) if isinstance(evt['metadata'], dict) else 0.0
                         for evt in self.buffer
@@ -221,6 +254,14 @@ class CXIFileWriterActor:
                     f.create_dataset(
                         '/LCLS/detector_1/EncoderValue',
                         data=np.array(encoder_values, dtype='float32')
+                    )
+                elif not np.any(timestamps_array != 0.0):
+                    # For backward compatibility with old data (no timestamps), create EncoderValue placeholder
+                    f.create_dataset(
+                        '/LCLS/detector_1/EncoderValue',
+                        (num_events,),
+                        dtype='float32',
+                        fillvalue=0.0
                     )
 
                 # Write events
