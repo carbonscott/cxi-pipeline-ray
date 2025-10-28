@@ -34,7 +34,9 @@ class CXIFileWriterActor:
         min_num_peak: int = 10,
         max_num_peak: int = 2048,
         file_prefix: str = "peaknet_cxi",
-        crystfel_mode: bool = False
+        crystfel_mode: bool = False,
+        save_segmentation_maps: bool = False,
+        save_logit_maps: bool = False
     ):
         """
         Initialize CXI file writer with CheetahConverter.
@@ -48,6 +50,8 @@ class CXIFileWriterActor:
             file_prefix: Prefix for CXI filenames
             crystfel_mode: Enable strict CrystFEL mode (requires geom_file,
                           adds LCLS datasets for downstream compatibility)
+            save_segmentation_maps: Save segmentation maps to CXI (debug mode)
+            save_logit_maps: Save logit maps to CXI (debug mode)
         """
         logging.basicConfig(level=logging.INFO)
 
@@ -59,6 +63,8 @@ class CXIFileWriterActor:
         self.max_num_peak = max_num_peak
         self.file_prefix = file_prefix
         self.crystfel_mode = crystfel_mode
+        self.save_segmentation_maps = save_segmentation_maps
+        self.save_logit_maps = save_logit_maps
 
         # Initialize CheetahConverter (expensive - done once per actor)
         self.cheetah_converter = None
@@ -99,7 +105,7 @@ class CXIFileWriterActor:
 
         logging.info(f"CXIFileWriterActor initialized: output_dir={output_dir}")
 
-    def submit_processed_batch(self, images, peaks_list, metadata_list):
+    def submit_processed_batch(self, images, peaks_list, metadata_list, seg_maps_list=None, logit_maps_list=None):
         """
         Non-blocking submission of processed batch.
 
@@ -107,15 +113,27 @@ class CXIFileWriterActor:
             images: Image data for events (may be ObjectRef or numpy array)
             peaks_list: List of peak positions per event (may be ObjectRef)
             metadata_list: Metadata for each event
+            seg_maps_list: Optional list of segmentation maps per event (debug mode)
+            logit_maps_list: Optional list of logit maps per event (debug mode), shape (num_classes, C, H, W)
         """
         # Dereference if ObjectRef
         if isinstance(peaks_list, ray.ObjectRef):
             peaks_list = ray.get(peaks_list)
         if isinstance(images, ray.ObjectRef):
             images = ray.get(images)
+        if isinstance(seg_maps_list, ray.ObjectRef):
+            seg_maps_list = ray.get(seg_maps_list)
+        if isinstance(logit_maps_list, ray.ObjectRef):
+            logit_maps_list = ray.get(logit_maps_list)
 
         # Process each event in batch
-        for img, peaks, metadata in zip(images, peaks_list, metadata_list):
+        # Handle seg_maps_list and logit_maps_list being None
+        if seg_maps_list is None:
+            seg_maps_list = [None] * len(images)
+        if logit_maps_list is None:
+            logit_maps_list = [None] * len(images)
+
+        for img, peaks, metadata, seg_map, logit_map in zip(images, peaks_list, metadata_list, seg_maps_list, logit_maps_list):
             # Filter by peak count
             if len(peaks) < self.min_num_peak:
                 self.total_events_filtered += 1
@@ -129,6 +147,24 @@ class CXIFileWriterActor:
                     cheetah_image = self.cheetah_converter.convert_to_cheetah_img(img, reduces_geom=True)
                     # Transform peak coordinates to assembled detector space
                     cheetah_peaks = self.cheetah_converter.convert_to_cheetah_coords(peaks)
+
+                    # Apply same transformation to segmentation map (if present)
+                    if seg_map is not None:
+                        cheetah_seg_map = self.cheetah_converter.convert_to_cheetah_img(seg_map, reduces_geom=True)
+                    else:
+                        cheetah_seg_map = None
+
+                    # Apply same transformation to logit maps (if present)
+                    # logit_map shape: (num_classes, C, H, W) - convert each class separately
+                    if logit_map is not None:
+                        cheetah_logit_maps = []
+                        for class_idx in range(logit_map.shape[0]):
+                            class_logit = logit_map[class_idx]  # (C, H, W)
+                            cheetah_class_logit = self.cheetah_converter.convert_to_cheetah_img(class_logit, reduces_geom=True)
+                            cheetah_logit_maps.append(cheetah_class_logit)
+                        cheetah_logit_map = np.stack(cheetah_logit_maps, axis=0)  # (num_classes, H_assembled, W)
+                    else:
+                        cheetah_logit_map = None
                 except Exception as e:
                     logging.warning(f"CheetahConverter failed: {e}, using manual assembly")
                     # Fallback: manually stack panels vertically
@@ -137,6 +173,22 @@ class CXIFileWriterActor:
                     else:
                         cheetah_image = img
                     cheetah_peaks = peaks
+
+                    # Apply same fallback to segmentation map
+                    if seg_map is not None and len(seg_map.shape) == 3:
+                        cheetah_seg_map = seg_map.reshape(-1, seg_map.shape[-1])
+                    else:
+                        cheetah_seg_map = seg_map
+
+                    # Apply same fallback to logit maps
+                    if logit_map is not None and len(logit_map.shape) == 4:  # (num_classes, C, H, W)
+                        cheetah_logit_maps = []
+                        for class_idx in range(logit_map.shape[0]):
+                            class_logit = logit_map[class_idx]  # (C, H, W)
+                            cheetah_logit_maps.append(class_logit.reshape(-1, class_logit.shape[-1]))  # (C*H, W)
+                        cheetah_logit_map = np.stack(cheetah_logit_maps, axis=0)  # (num_classes, C*H, W)
+                    else:
+                        cheetah_logit_map = logit_map
             else:
                 # No CheetahConverter: manually assemble
                 if len(img.shape) == 3:  # (C, H, W)
@@ -145,11 +197,29 @@ class CXIFileWriterActor:
                     cheetah_image = img
                 cheetah_peaks = peaks
 
+                # Apply same manual assembly to segmentation map
+                if seg_map is not None and len(seg_map.shape) == 3:
+                    cheetah_seg_map = seg_map.reshape(-1, seg_map.shape[-1])  # (C*H, W)
+                else:
+                    cheetah_seg_map = seg_map
+
+                # Apply same manual assembly to logit maps
+                if logit_map is not None and len(logit_map.shape) == 4:  # (num_classes, C, H, W)
+                    cheetah_logit_maps = []
+                    for class_idx in range(logit_map.shape[0]):
+                        class_logit = logit_map[class_idx]  # (C, H, W)
+                        cheetah_logit_maps.append(class_logit.reshape(-1, class_logit.shape[-1]))  # (C*H, W)
+                    cheetah_logit_map = np.stack(cheetah_logit_maps, axis=0)  # (num_classes, C*H, W)
+                else:
+                    cheetah_logit_map = logit_map
+
             # Add to buffer
             self.buffer.append({
                 'image': cheetah_image,
                 'peaks': cheetah_peaks,
-                'metadata': metadata
+                'metadata': metadata,
+                'seg_map': cheetah_seg_map,  # Now assembled to match image dimensions
+                'logit_map': cheetah_logit_map  # (num_classes, H_assembled, W) or None
             })
 
         # Flush if buffer full
@@ -203,6 +273,40 @@ class CXIFileWriterActor:
                     (num_events,),
                     dtype='int'
                 )
+
+                # Debug mode: Add segmentation_map dataset
+                if self.save_segmentation_maps:
+                    # Get seg_map shape from first event (should be H_assembled, W - same as detector image)
+                    first_seg_map = next((evt['seg_map'] for evt in self.buffer if evt.get('seg_map') is not None), None)
+                    if first_seg_map is not None:
+                        seg_map_shape = first_seg_map.shape  # (H_assembled, W) - matches detector image
+                        f.create_dataset(
+                            '/entry_1/result_1/segmentation_map',
+                            (num_events, *seg_map_shape),
+                            dtype='uint8',
+                            compression='gzip',
+                            compression_opts=4
+                        )
+                        logging.debug(f"Created segmentation_map dataset: ({num_events}, {seg_map_shape}) - matches detector image dimensions")
+
+                # Debug mode: Add logit_map datasets (one per class)
+                if self.save_logit_maps:
+                    # Get logit_map shape from first event (should be num_classes, H_assembled, W)
+                    first_logit_map = next((evt['logit_map'] for evt in self.buffer if evt.get('logit_map') is not None), None)
+                    if first_logit_map is not None:
+                        num_classes = first_logit_map.shape[0]  # Should be 2 for PeakNet
+                        logit_map_shape = first_logit_map.shape[1:]  # (H_assembled, W)
+
+                        # Create separate datasets for each class
+                        for class_idx in range(num_classes):
+                            f.create_dataset(
+                                f'/entry_1/result_1/logit_map_class{class_idx}',
+                                (num_events, *logit_map_shape),
+                                dtype='float32',
+                                compression='gzip',
+                                compression_opts=4
+                            )
+                        logging.debug(f"Created {num_classes} logit_map datasets: ({num_events}, {logit_map_shape}) - matches detector image dimensions")
 
                 # CrystFEL mode: Add peakTotalIntensity dataset
                 # Note: This is a placeholder - was never real data in old pipeline
@@ -268,6 +372,16 @@ class CXIFileWriterActor:
                 for event_idx, evt in enumerate(self.buffer):
                     # Write image
                     f['/entry_1/data_1/data'][event_idx] = evt['image']
+
+                    # Write segmentation map (debug mode)
+                    if self.save_segmentation_maps and evt.get('seg_map') is not None:
+                        f['/entry_1/result_1/segmentation_map'][event_idx] = evt['seg_map']
+
+                    # Write logit maps (debug mode)
+                    if self.save_logit_maps and evt.get('logit_map') is not None:
+                        logit_map = evt['logit_map']  # (num_classes, H_assembled, W)
+                        for class_idx in range(logit_map.shape[0]):
+                            f[f'/entry_1/result_1/logit_map_class{class_idx}'][event_idx] = logit_map[class_idx]
 
                     # Write peak count
                     num_peaks = min(len(evt['peaks']), self.max_num_peak)
