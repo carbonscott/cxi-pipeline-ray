@@ -1,11 +1,13 @@
 """Core components for CXI pipeline processing."""
 
-from .peak_finding import process_samples_task
+from .peak_finding import find_peaks_numpy
 from .file_writer import CXIFileWriterActor
-from .coordinator import run_cpu_postprocessing_pipeline
+from .coordinator import group_panels_into_events, run_sync_pipeline, process_batch
 
 __all__ = [
-    "process_samples_task",
+    "find_peaks_numpy",
     "CXIFileWriterActor",
-    "run_cpu_postprocessing_pipeline",
+    "group_panels_into_events",
+    "run_sync_pipeline",
+    "process_batch",
 ]

@@ -5,9 +5,38 @@ This module provides utilities to reconstruct detector images from preprocessed
 format back to original size, and convert physics metadata to CXI-compatible formats.
 """
 
+import logging
 import numpy as np
 import ray
 from typing import Union
+
+
+def reconstruct_from_arrays(original_image: np.ndarray, original_shape: tuple, preprocessed_shape: tuple) -> np.ndarray:
+    """
+    Reconstruct detector image from preprocessed format.
+
+    Args:
+        original_image: (B*C, 1, H, W) preprocessed image
+        original_shape: (B, C, H_orig, W_orig)
+        preprocessed_shape: (B*C, 1, H, W)
+
+    Returns:
+        detector_image: (B, C, H_orig, W_orig) in original coordinates
+    """
+    B, C, H_orig, W_orig = original_shape
+    BC, _, H, W = preprocessed_shape
+
+    if original_image.shape != (BC, 1, H, W):
+        raise ValueError(f"Image shape {original_image.shape} doesn't match preprocessed_shape {preprocessed_shape}")
+
+    # Reshape: (B*C, 1, H, W) → (B, C, H, W)
+    image_reshaped = original_image.reshape(B, C, H, W)
+
+    # Unpad: (B, C, H, W) → (B, C, H_orig, W_orig)
+    # Bottom-right padding means original data is at [0:H_orig, 0:W_orig]
+    image_original = image_reshaped[:, :, :H_orig, :W_orig]
+
+    return image_original
 
 
 def reconstruct_detector_image(output) -> np.ndarray:
@@ -23,18 +52,10 @@ def reconstruct_detector_image(output) -> np.ndarray:
 
     Returns:
         detector_image: (B, C, H_orig, W_orig) numpy array in original coordinates
-
-    Raises:
-        ValueError: If preprocessing_metadata is missing or invalid
-
-    Example:
-        >>> output = q2_manager.get()
-        >>> detector_image = reconstruct_detector_image(output)
-        >>> assert detector_image.shape == (8, 16, 352, 384)  # B=8, C=16 panels
     """
     # Check if preprocessing metadata is available
     if output.preprocessing_metadata is None:
-        # No preprocessing was applied - return image as-is
+        logging.warning("preprocessing_metadata is None — returning image as-is")
         if output.original_image_ref is None:
             raise ValueError("Both preprocessing_metadata and original_image_ref are None")
         return ray.get(output.original_image_ref)
@@ -45,25 +66,11 @@ def reconstruct_detector_image(output) -> np.ndarray:
 
     detector_image = ray.get(output.original_image_ref)  # (B*C, 1, H, W)
 
-    # Extract shape information from metadata
-    B, C, H_orig, W_orig = output.preprocessing_metadata.original_shape
-    BC, _, H, W = output.preprocessing_metadata.preprocessed_shape
-
-    # Validate shapes
-    if detector_image.shape != (BC, 1, H, W):
-        raise ValueError(
-            f"Image shape {detector_image.shape} doesn't match "
-            f"preprocessed_shape {(BC, 1, H, W)} from metadata"
-        )
-
-    # Step 1: Reshape (B*C, 1, H, W) → (B, C, H, W)
-    detector_image_reshaped = detector_image.reshape(B, C, H, W)
-
-    # Step 2: Unpad (B, C, H, W) → (B, C, H_orig, W_orig)
-    # Bottom-right padding means original data is at [0:H_orig, 0:W_orig]
-    detector_image_original = detector_image_reshaped[:, :, :H_orig, :W_orig]
-
-    return detector_image_original
+    return reconstruct_from_arrays(
+        detector_image,
+        output.preprocessing_metadata.original_shape,
+        output.preprocessing_metadata.preprocessed_shape,
+    )
 
 
 def wavelength_to_energy(wavelength: Union[float, np.ndarray], unit: str = 'angstrom') -> Union[float, np.ndarray]:

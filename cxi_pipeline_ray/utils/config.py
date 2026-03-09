@@ -60,15 +60,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
     if 'poll_timeout' not in config['queue']:
         config['queue']['poll_timeout'] = 0.01
 
-    if 'processing' not in config:
-        config['processing'] = {}
-
-    if 'num_cpu_workers' not in config['processing']:
-        config['processing']['num_cpu_workers'] = 16
-
-    if 'max_pending_tasks' not in config['processing']:
-        config['processing']['max_pending_tasks'] = 100
-
     if 'peak_finding' not in config:
         config['peak_finding'] = {}
 
@@ -87,6 +78,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
     if 'create_output_dir' not in config['output']:
         config['output']['create_output_dir'] = True
 
+    if 'batches_per_file' not in config['output']:
+        config['output']['batches_per_file'] = 10
+
     return config
 
 
@@ -101,14 +95,13 @@ def merge_config_with_overrides(config: Dict[str, Any], cli_args) -> Dict[str, A
     Returns:
         Updated configuration dictionary
     """
-    # Override processing settings if provided
-    if hasattr(cli_args, 'num_cpu_workers') and cli_args.num_cpu_workers is not None:
-        config['processing']['num_cpu_workers'] = cli_args.num_cpu_workers
-
-    if hasattr(cli_args, 'max_pending_tasks') and cli_args.max_pending_tasks is not None:
-        config['processing']['max_pending_tasks'] = cli_args.max_pending_tasks
-
     # Override output settings if provided
+    if hasattr(cli_args, 'batches_per_file') and cli_args.batches_per_file is not None:
+        config['output']['batches_per_file'] = cli_args.batches_per_file
+
+    if hasattr(cli_args, 'save_segmentation_maps') and cli_args.save_segmentation_maps:
+        config['output']['save_segmentation_maps'] = True
+
     if hasattr(cli_args, 'output_dir') and cli_args.output_dir is not None:
         config['output']['output_dir'] = cli_args.output_dir
 

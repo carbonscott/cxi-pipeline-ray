@@ -1,6 +1,6 @@
 [project]
 name = "cxi-pipeline-ray"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ray-based CPU post-processing pipeline for PeakNet inference results"
 authors = [
     {name = "Chun Hong Yoon", email = "cxyoon@slac.stanford.edu"},
@@ -14,7 +14,6 @@ dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
     "h5py>=3.0.0",
-    "torch>=2.0.0",
     "pyyaml>=6.0",
 ]
 

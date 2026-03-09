@@ -13,7 +13,8 @@ import ray
 
 from .utils.config import load_config, merge_config_with_overrides
 from .utils.validation import print_validation_result
-from .core.coordinator import run_cpu_postprocessing_pipeline
+from .core.coordinator import run_sync_pipeline
+from .core.file_writer import CXIFileWriterActor
 from .version import __version__
 
 
@@ -72,7 +73,7 @@ def main():
     2. Validation mode: Validate config consistency
     """
     parser = argparse.ArgumentParser(
-        description="CXI Pipeline Writer - Ray-based CPU post-processing for PeakNet inference",
+        description="CXI Pipeline Writer - Synchronous post-processing for PeakNet inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -80,7 +81,7 @@ Examples:
   cxi-writer --config cxi_writer.yaml
 
   # With CLI overrides
-  cxi-writer --config cxi_writer.yaml --num-cpu-workers 32 --output-dir /custom/path
+  cxi-writer --config cxi_writer.yaml --batches-per-file 20 --output-dir /custom/path
 
   # Validate config consistency
   cxi-writer --validate-config --pipeline-config pipeline.yaml --writer-config writer.yaml
@@ -116,15 +117,15 @@ Examples:
 
     # CLI overrides
     parser.add_argument(
-        '--num-cpu-workers',
+        '--batches-per-file',
         type=int,
-        help='Override number of CPU workers'
+        help='Write CXI file every N batches (default: 10)'
     )
 
     parser.add_argument(
-        '--max-pending-tasks',
-        type=int,
-        help='Override max pending tasks (backpressure limit)'
+        '--save-segmentation-maps',
+        action='store_true',
+        help='Save segmentation maps to /entry_1/result_1/segmentation_map (debug mode)'
     )
 
     parser.add_argument(
@@ -186,7 +187,7 @@ Examples:
     logger.info(f"Ray namespace: {config['ray']['namespace']}")
     logger.info(f"Queue: {config['queue']['name']} ({config['queue']['num_shards']} shards)")
     logger.info(f"Output dir: {config['output']['output_dir']}")
-    logger.info(f"CPU workers: {config['processing']['num_cpu_workers']}")
+    logger.info(f"Batches per file: {config['output']['batches_per_file']}")
 
     # Connect to Ray
     logger.info("Connecting to Ray cluster...")
@@ -220,19 +221,28 @@ Examples:
         logger.error(f"Failed to connect to Q2 queue: {e}")
         sys.exit(1)
 
+    # Create file writer actor
+    logger.info("Creating CXI file writer actor...")
+    geom_file = config.get('geometry', {}).get('geom_file')
+    file_writer = CXIFileWriterActor.remote(
+        output_dir=config['output']['output_dir'],
+        geom_file=geom_file,
+        buffer_size=config['output']['buffer_size'],
+        min_num_peak=config['peak_finding']['min_num_peak'],
+        max_num_peak=config['peak_finding']['max_num_peak'],
+        file_prefix=config['output']['file_prefix'],
+        crystfel_mode=geom_file is not None,
+        save_segmentation_maps=config['output'].get('save_segmentation_maps', False),
+    )
+
     # Run pipeline
-    logger.info("Starting CPU post-processing pipeline...")
+    logger.info("Starting synchronous post-processing pipeline...")
     try:
-        run_cpu_postprocessing_pipeline(
+        run_sync_pipeline(
             q2_manager=q2_manager,
-            output_dir=config['output']['output_dir'],
-            geom_file=config.get('geometry', {}).get('geom_file'),
-            num_cpu_workers=config['processing']['num_cpu_workers'],
-            buffer_size=config['output']['buffer_size'],
-            min_num_peak=config['peak_finding']['min_num_peak'],
-            max_num_peak=config['peak_finding']['max_num_peak'],
-            max_pending_tasks=config['processing']['max_pending_tasks'],
-            file_prefix=config['output']['file_prefix']
+            file_writer=file_writer,
+            batches_per_file=config['output']['batches_per_file'],
+            save_segmentation_maps=config['output'].get('save_segmentation_maps', False),
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

@@ -1,28 +1,16 @@
 """
-Main pipeline coordinator with Ray best practices.
+Synchronous pipeline coordinator for CXI post-processing.
 
-This module implements the optimized CPU post-processing pipeline that:
-- Pulls batches from Q2
-- Splits into mini-batches for parallel processing
-- Launches Ray tasks with backpressure control
-- Submits results to file writer actor
-
-Key optimizations:
-- Batched ray.get() calls (no loops) - +20-30% throughput
-- ObjectRefs for large objects - -90% memory usage
-- Backpressure control - Prevents OOM
-- Pipelining pattern - +10-15% throughput
-- Efficient ray.wait() usage
+Pulls batches from Q2, runs peak finding, groups panels into events,
+and submits results to the CXI file writer actor.
 """
 
 import logging
-import time
-import ray
 import numpy as np
+import ray
 
-from .peak_finding import process_samples_task
-from .file_writer import CXIFileWriterActor
-from .reconstruction import reconstruct_detector_image, wavelength_to_energy
+from .peak_finding import find_peaks_numpy
+from .reconstruction import reconstruct_from_arrays, wavelength_to_energy
 
 
 def group_panels_into_events(batch_info):
@@ -130,369 +118,195 @@ def group_panels_into_events(batch_info):
     return event_images, event_peaks, event_metadata, event_seg_maps
 
 
-def run_cpu_postprocessing_pipeline(
-    q2_manager,
-    output_dir: str,
-    geom_file: str,
-    num_cpu_workers: int = 16,
-    buffer_size: int = 100,
-    min_num_peak: int = 10,
-    max_num_peak: int = 2048,
-    max_pending_tasks: int = 100,
-    file_prefix: str = "peaknet_cxi"
-):
+def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = False):
     """
-    Optimized CPU post-processing pipeline with Ray best practices.
+    Process a single batch from Q2 through peak finding and submit to writer.
 
-    Architecture:
-    - Pulls batches from Q2 (ShardedQueue)
-    - Splits into mini-batches for parallel processing
-    - Launches Ray tasks for peak finding (stateless)
-    - Submits results to file writer actor (stateful)
+    Args:
+        pipeline_output: PipelineOutput object from Q2
+        file_writer: CXIFileWriterActor instance
+        save_segmentation_maps: Save segmentation maps to CXI (debug mode)
+
+    Returns:
+        Number of events processed
+    """
+    # Extract logits
+    logits = pipeline_output.get_torch_tensor(device='cpu').numpy()  # (B*C, num_classes, H, W)
+
+    # Extract B, C, H_orig, W_orig from preprocessing metadata
+    B, C, H_orig, W_orig = None, None, None, None
+
+    if hasattr(pipeline_output, 'preprocessing_metadata') and pipeline_output.preprocessing_metadata is not None:
+        original_shape = pipeline_output.preprocessing_metadata.original_shape
+        B, C, H_orig, W_orig = original_shape
+        logging.debug(f"Extracted shape from metadata: B={B}, C={C}, H={H_orig}, W={W_orig}")
+    else:
+        logging.warning("NO preprocessing_metadata found! This may cause detector image/seg map mismatch!")
+
+    # Try to extract detector images (can fail independently)
+    detector_images_4d = None
+
+    if hasattr(pipeline_output, 'original_image_ref') and pipeline_output.original_image_ref is not None:
+        try:
+            if hasattr(pipeline_output, 'preprocessing_metadata') and pipeline_output.preprocessing_metadata is not None:
+                original_image = ray.get(pipeline_output.original_image_ref)
+                preprocessed_shape = pipeline_output.preprocessing_metadata.preprocessed_shape
+                detector_images_4d = reconstruct_from_arrays(original_image, original_shape, preprocessed_shape)
+                logging.debug(f"Reconstructed detector images: {detector_images_4d.shape}")
+            else:
+                original_image_raw = ray.get(pipeline_output.original_image_ref)
+                logging.warning(f"NO preprocessing metadata - using images as-is: {original_image_raw.shape}")
+                detector_images_4d = original_image_raw
+        except Exception as e:
+            logging.warning(f"Failed to extract detector images: {e}")
+            detector_images_4d = None
+    else:
+        logging.warning("NO original_image_ref found! Detector images will be None")
+
+    # Extract physics metadata
+    metadata = pipeline_output.metadata if hasattr(pipeline_output, 'metadata') else {}
+
+    # Handle photon wavelength → energy conversion
+    photon_wavelength = metadata.get('photon_wavelength', None)
+    photon_energy = metadata.get('photon_energy', None)
+
+    if photon_wavelength is not None:
+        if isinstance(photon_wavelength, (list, np.ndarray)):
+            photon_energy = np.array([wavelength_to_energy(w) for w in photon_wavelength])
+        else:
+            photon_energy = wavelength_to_energy(float(photon_wavelength))
+
+    timestamp = metadata.get('timestamp', None)
+
+    # Run peak finding on logits
+    logging.debug(f"Running peak finding on {logits.shape[0]} panels (logits shape: {logits.shape})...")
+    if B and C and logits.shape[0] != B * C:
+        logging.error(f"MISMATCH: logits.shape[0]={logits.shape[0]} but B*C={B*C}!")
+
+    all_peaks = []
+    all_seg_maps = [] if save_segmentation_maps else None
+
+    for panel_idx in range(logits.shape[0]):
+        panel_logits = logits[panel_idx]  # (2, H, W)
+
+        if save_segmentation_maps:
+            peaks, seg_map = find_peaks_numpy(panel_logits, return_seg_map=True)
+        else:
+            peaks = find_peaks_numpy(panel_logits)
+
+        # Clip peaks to original bounds
+        if H_orig and W_orig:
+            peaks_transformed = []
+            for peak in peaks:
+                _, y, x = peak
+                if y < H_orig and x < W_orig:
+                    peaks_transformed.append([0, y, x])
+            all_peaks.append(np.array(peaks_transformed) if peaks_transformed else np.array([]).reshape(0, 3))
+
+            if save_segmentation_maps:
+                all_seg_maps.append(seg_map[:H_orig, :W_orig])
+        else:
+            all_peaks.append(peaks)
+            if save_segmentation_maps:
+                all_seg_maps.append(seg_map)
+
+    # Group panels into events
+    completed_panels = []
+    for panel_idx in range(len(all_peaks)):
+        completed_panels.append((panel_idx, all_peaks[panel_idx], None))
+
+    batch_info = {
+        'completed_panels': completed_panels,
+        'B': B if B is not None else 1,
+        'C': C if C is not None else len(all_peaks),
+        'H_orig': H_orig,
+        'W_orig': W_orig,
+        'detector_images_4d': detector_images_4d,
+        'photon_energy': photon_energy,
+        'photon_wavelength': photon_wavelength,
+        'timestamp': timestamp,
+        'metadata': metadata,
+        'num_panels': len(all_peaks),
+        'segmentation_maps': all_seg_maps,
+    }
+
+    event_images, event_peaks, event_metadata, event_seg_maps = group_panels_into_events(batch_info)
+
+    # Submit to file writer
+    file_writer.submit_processed_batch.remote(event_images, event_peaks, event_metadata, event_seg_maps)
+
+    total_peaks = sum(len(p) for p in all_peaks)
+    logging.debug(f"Submitted {len(event_images)} events, {total_peaks} total peaks")
+
+    return len(event_images)
+
+
+def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_segmentation_maps: bool = False):
+    """
+    Synchronous pipeline: pull from Q2, process, write CXI files.
 
     Args:
         q2_manager: ShardedQueueManager for Q2 output queue
-        output_dir: Directory for CXI files
-        geom_file: Geometry file for CheetahConverter (can be None to skip conversion)
-        num_cpu_workers: Number of parallel CPU tasks for peak finding
-        buffer_size: Events to buffer before writing CXI
-        min_num_peak: Minimum peaks to save event
-        max_num_peak: Maximum peaks per event
-        max_pending_tasks: Max pending tasks (backpressure limit)
-        file_prefix: Prefix for CXI filenames
-
-    Key improvements:
-    - Batched ray.get() calls (no loops) - +20-30% throughput
-    - ObjectRefs for large objects - -90% memory usage
-    - Backpressure control - Prevents OOM
-    - Pipelining pattern - +10-15% throughput
-    - Efficient ray.wait() usage
+        file_writer: CXIFileWriterActor instance (already created)
+        batches_per_file: Write CXI file every N batches
+        save_segmentation_maps: Save segmentation maps to CXI (debug mode)
     """
-    logging.info("=== Starting Optimized CPU Post-Processing Pipeline ===")
-    logging.info(f"CPU workers: {num_cpu_workers}")
-    logging.info(f"Max pending tasks: {max_pending_tasks}")
-    logging.info(f"Output dir: {output_dir}")
-    logging.info(f"Geometry file: {geom_file}")
+    logger = logging.getLogger(__name__)
+    logger.info("Starting synchronous pipeline loop...")
+    logger.info(f"Batches per file: {batches_per_file}")
+    logger.info(f"Save segmentation maps: {save_segmentation_maps}")
 
-    # Determine if CrystFEL mode based on geometry file
-    crystfel_mode = geom_file is not None and geom_file != ""
-
-    # Create file writer actor (stateful)
-    file_writer = CXIFileWriterActor.remote(
-        output_dir=output_dir,
-        geom_file=geom_file,
-        buffer_size=buffer_size,
-        min_num_peak=min_num_peak,
-        max_num_peak=max_num_peak,
-        file_prefix=file_prefix,
-        crystfel_mode=crystfel_mode
-    )
-
-    # Create shared structure for all tasks (8-connectivity)
-    structure = np.ones((3, 3), dtype=np.float32)
-    structure_ref = ray.put(structure)  # Put once, share everywhere
-
-    # Track in-flight tasks
-    pending_tasks = []
-    batch_tracker = {}  # Track batch-level information for event grouping
-    batch_id_counter = 0
-    batches_processed = 0
-    start_time = time.time()
-
-    logging.info("Starting main consumption loop...")
-
-    # OPTIMIZATION: Pipelining - prefetch first batch
-    current_batch = q2_manager.get(timeout=0.01)
+    batch_count = 0
+    total_events = 0
+    batches_since_flush = 0
 
     try:
         while True:
-            # RAY BEST PRACTICE: Backpressure control - wait if too many pending
-            if len(pending_tasks) >= max_pending_tasks:
-                logging.debug(f"Backpressure: {len(pending_tasks)} pending, waiting...")
+            # Pull batch from Q2 (blocking with short timeout)
+            pipeline_output = q2_manager.get(timeout=0.1)
 
-                # Block until at least one completes
-                ready_refs = [t['task_ref'] for t in pending_tasks]
-                ready, not_ready_refs = ray.wait(
-                    ready_refs,
-                    num_returns=1,  # Wait for at least 1
-                    timeout=None  # Blocking
-                )
-
-                # RAY BEST PRACTICE: Batch ray.get() - fetch all at once
-                ready_peaks = ray.get(ready)
-                ready_task_map = {ref: peaks for ref, peaks in zip(ready, ready_peaks)}
-
-                # Collect completed panel results
-                completed_batches = set()
-                for task_ref in ready:
-                    task_data = next(t for t in pending_tasks if t['task_ref'] == task_ref)
-                    batch_id = task_data['batch_id']
-                    panel_start_idx = task_data['panel_start_idx']
-                    panel_count = task_data['panel_count']
-                    peaks_list = ready_task_map[task_ref]
-
-                    # Store peaks for each panel in this mini-batch
-                    batch_info = batch_tracker[batch_id]
-                    for i in range(panel_count):
-                        panel_idx = panel_start_idx + i
-                        panel_peaks = peaks_list[i] if i < len(peaks_list) else []
-                        batch_info['completed_panels'].append((panel_idx, panel_peaks, None))
-
-                    # Check if this batch is complete
-                    if len(batch_info['completed_panels']) >= batch_info['num_panels']:
-                        completed_batches.add(batch_id)
-
-                # Update pending list
-                pending_tasks = [t for t in pending_tasks if t['task_ref'] not in ready]
-
-                # Submit completed batches
-                for batch_id in completed_batches:
-                    batch_info = batch_tracker[batch_id]
-                    event_images, event_peaks, event_metadata = group_panels_into_events(batch_info)
-                    file_writer.submit_processed_batch.remote(event_images, event_peaks, event_metadata)
-                    del batch_tracker[batch_id]
-
-            # Check if we have a batch to process
-            if current_batch is None:
-                # OPTIMIZATION: Pipelining - prefetch next batch
-                current_batch = q2_manager.get(timeout=0.01)
-
-                # Check pending tasks while waiting
-                if pending_tasks:
-                    ready_refs = [t['task_ref'] for t in pending_tasks]
-                    ready, not_ready_refs = ray.wait(
-                        ready_refs,
-                        num_returns=min(10, len(ready_refs)),  # Optimized num_returns
-                        timeout=0  # Non-blocking
-                    )
-
-                    if ready:
-                        # Batch ray.get()
-                        ready_peaks = ray.get(ready)
-                        ready_task_map = {ref: peaks for ref, peaks in zip(ready, ready_peaks)}
-
-                        # Collect completed panel results
-                        completed_batches = set()
-                        for task_ref in ready:
-                            task_data = next(t for t in pending_tasks if t['task_ref'] == task_ref)
-                            batch_id = task_data['batch_id']
-                            panel_start_idx = task_data['panel_start_idx']
-                            panel_count = task_data['panel_count']
-                            peaks_list = ready_task_map[task_ref]
-
-                            # Store peaks for each panel in this mini-batch
-                            batch_info = batch_tracker[batch_id]
-                            for i in range(panel_count):
-                                panel_idx = panel_start_idx + i
-                                panel_peaks = peaks_list[i] if i < len(peaks_list) else []
-                                batch_info['completed_panels'].append((panel_idx, panel_peaks, None))
-
-                            # Check if this batch is complete
-                            if len(batch_info['completed_panels']) >= batch_info['num_panels']:
-                                completed_batches.add(batch_id)
-
-                        pending_tasks = [t for t in pending_tasks if t['task_ref'] not in ready]
-
-                        # Submit completed batches
-                        for batch_id in completed_batches:
-                            batch_info = batch_tracker[batch_id]
-                            event_images, event_peaks, event_metadata = group_panels_into_events(batch_info)
-                            file_writer.submit_processed_batch.remote(event_images, event_peaks, event_metadata)
-                            del batch_tracker[batch_id]
-
+            if pipeline_output is None:
                 continue
 
-            # Extract data from current PipelineOutput
-            logits = current_batch.get_torch_tensor(device='cpu')  # (B*C, num_classes, H, W)
+            # Process batch
+            num_events = process_batch(
+                pipeline_output,
+                file_writer,
+                save_segmentation_maps=save_segmentation_maps,
+            )
+            batch_count += 1
+            total_events += num_events
+            batches_since_flush += 1
 
-            # NEW: Extract and reconstruct detector images for CXI file writing
-            detector_images_4d = None
-            B, C, H_orig, W_orig = None, None, None, None
-            if hasattr(current_batch, 'original_image_ref') and current_batch.original_image_ref is not None:
-                try:
-                    if hasattr(current_batch, 'preprocessing_metadata') and current_batch.preprocessing_metadata is not None:
-                        # Reconstruct to original size: (B*C,1,H,W) → (B,C,H_orig,W_orig)
-                        detector_images_4d = reconstruct_detector_image(current_batch)
-                        # Keep as 4D for event structure - don't flatten!
-                        B, C, H_orig, W_orig = detector_images_4d.shape
-                        logging.debug(f"Reconstructed detector images: {detector_images_4d.shape}")
-                    else:
-                        # No preprocessing metadata - use as-is
-                        detector_images_4d = ray.get(current_batch.original_image_ref)
-                        logging.debug(f"Using detector images as-is: {detector_images_4d.shape}")
-                except Exception as e:
-                    logging.warning(f"Failed to extract detector images: {e}, will use logits as fallback")
-                    detector_images_4d = None
+            logger.info(f"Processed batch {batch_count}: {num_events} events (total: {total_events})")
 
-            # NEW: Extract physics metadata and convert to CXI format
-            metadata = current_batch.metadata if hasattr(current_batch, 'metadata') else {}
-
-            # Handle photon wavelength → energy conversion (event-level)
-            photon_wavelength = metadata.get('photon_wavelength', None)
-            photon_energy = metadata.get('photon_energy', None)
-
-            if photon_wavelength is not None:
-                # Convert wavelength to energy
-                if isinstance(photon_wavelength, (list, np.ndarray)):
-                    photon_energy = wavelength_to_energy(np.array(photon_wavelength), unit='angstrom')
-                else:
-                    photon_energy = wavelength_to_energy(float(photon_wavelength), unit='angstrom')
-
-            # Extract timestamp (event-level)
-            timestamp = metadata.get('timestamp', None)
-
-            # Store batch-level metadata for later event grouping
-            batch_size = logits.size(0)  # B*C panels
-            batch_id = batch_id_counter
-            batch_id_counter += 1
-
-            # Store batch-level information for event grouping
-            batch_tracker[batch_id] = {
-                'detector_images_4d': detector_images_4d,  # (B, C, H, W)
-                'B': B,
-                'C': C,
-                'H_orig': H_orig,
-                'W_orig': W_orig,
-                'photon_energy': photon_energy,
-                'photon_wavelength': photon_wavelength,
-                'timestamp': timestamp,
-                'metadata': metadata,
-                'num_panels': batch_size,
-                'completed_panels': [],  # Will collect (panel_idx, peaks, image)
-            }
-
-            # Split batch into mini-batches for parallel processing
-            samples_per_task = max(1, batch_size // num_cpu_workers)
-
-            # Launch parallel tasks
-            for i in range(0, batch_size, samples_per_task):
-                mini_batch_logits = logits[i:i+samples_per_task]
-
-                # RAY BEST PRACTICE: Use ray.put() for large objects
-                mini_batch_logits_ref = ray.put(mini_batch_logits)  # Zero-copy via object store
-
-                # Launch task
-                task_ref = process_samples_task.remote(mini_batch_logits_ref, structure_ref)
-
-                pending_tasks.append({
-                    'task_ref': task_ref,
-                    'batch_id': batch_id,
-                    'panel_start_idx': i,  # Starting panel index in this mini-batch
-                    'panel_count': min(samples_per_task, batch_size - i)
-                })
-
-            batches_processed += 1
-
-            # Get next batch for next iteration
-            current_batch = q2_manager.get(timeout=0.01)
-
-            # Non-blocking check for completed tasks
-            if pending_tasks:
-                ready_refs = [t['task_ref'] for t in pending_tasks]
-                ready, not_ready_refs = ray.wait(
-                    ready_refs,
-                    num_returns=min(10, len(ready_refs)),  # Optimized num_returns
-                    timeout=0  # Non-blocking
-                )
-
-                if ready:
-                    # RAY BEST PRACTICE: Batch ray.get()
-                    ready_peaks = ray.get(ready)
-                    ready_task_map = {ref: peaks for ref, peaks in zip(ready, ready_peaks)}
-
-                    # Collect completed panel results
-                    completed_batches = set()
-                    for task_ref in ready:
-                        task_data = next(t for t in pending_tasks if t['task_ref'] == task_ref)
-                        batch_id = task_data['batch_id']
-                        panel_start_idx = task_data['panel_start_idx']
-                        panel_count = task_data['panel_count']
-                        peaks_list = ready_task_map[task_ref]
-
-                        # Store peaks for each panel in this mini-batch
-                        batch_info = batch_tracker[batch_id]
-                        for i in range(panel_count):
-                            panel_idx = panel_start_idx + i
-                            panel_peaks = peaks_list[i] if i < len(peaks_list) else []
-                            batch_info['completed_panels'].append((panel_idx, panel_peaks, None))
-
-                        # Check if this batch is complete
-                        if len(batch_info['completed_panels']) >= batch_info['num_panels']:
-                            completed_batches.add(batch_id)
-
-                    # Remove completed tasks from pending
-                    pending_tasks = [t for t in pending_tasks if t['task_ref'] not in ready]
-
-                    # Submit completed batches
-                    for batch_id in completed_batches:
-                        batch_info = batch_tracker[batch_id]
-
-                        # Group panels into events
-                        event_images, event_peaks, event_metadata = group_panels_into_events(batch_info)
-
-                        # Submit to file writer
-                        file_writer.submit_processed_batch.remote(
-                            event_images,
-                            event_peaks,
-                            event_metadata
-                        )
-
-                        # Clean up
-                        del batch_tracker[batch_id]
+            # Periodic flush: write CXI file every N batches
+            if batches_since_flush >= batches_per_file:
+                logger.info(f"=== Writing CXI file after {batches_since_flush} batches ===")
+                stats = ray.get(file_writer.flush_final.remote())
+                logger.info(f"Wrote CXI: {stats['chunks_written']} files, "
+                           f"{stats['total_events_written']} events written, "
+                           f"{stats['total_events_filtered']} events filtered")
+                batches_since_flush = 0
 
             # Progress logging
-            if batches_processed % 50 == 0:
-                elapsed = time.time() - start_time
-                rate = batches_processed / elapsed if elapsed > 0 else 0
-                logging.info(
-                    f"Processed {batches_processed} batches, "
-                    f"{rate:.1f} batches/s, "
-                    f"{len(pending_tasks)} pending tasks"
-                )
+            if batch_count % 50 == 0:
+                logger.info(f"Progress: {batch_count} batches, {total_events} events")
 
     except KeyboardInterrupt:
-        logging.info("Received interrupt signal - shutting down...")
-
+        logger.info("\n=== Interrupted by user ===")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
-        # Wait for remaining tasks
-        if pending_tasks:
-            logging.info(f"Waiting for {len(pending_tasks)} pending tasks...")
-            ready_refs = [t['task_ref'] for t in pending_tasks]
-
-            # RAY BEST PRACTICE: Batch ray.get()
-            all_peaks = ray.get(ready_refs)
-            peaks_map = {ref: peaks for ref, peaks in zip(ready_refs, all_peaks)}
-
-            # Collect remaining panel results
-            for task_data in pending_tasks:
-                batch_id = task_data['batch_id']
-                panel_start_idx = task_data['panel_start_idx']
-                panel_count = task_data['panel_count']
-                peaks_list = peaks_map[task_data['task_ref']]
-
-                batch_info = batch_tracker[batch_id]
-                for i in range(panel_count):
-                    panel_idx = panel_start_idx + i
-                    panel_peaks = peaks_list[i] if i < len(peaks_list) else []
-                    batch_info['completed_panels'].append((panel_idx, panel_peaks, None))
-
-            # Submit all remaining batches
-            for batch_id in list(batch_tracker.keys()):
-                batch_info = batch_tracker[batch_id]
-                event_images, event_peaks, event_metadata = group_panels_into_events(batch_info)
-                file_writer.submit_processed_batch.remote(event_images, event_peaks, event_metadata)
-                del batch_tracker[batch_id]
-
         # Final flush
-        logging.info("Flushing final CXI file...")
+        logger.info("Flushing final CXI file...")
         stats = ray.get(file_writer.flush_final.remote())
 
-        total_time = time.time() - start_time
-
-        logging.info("=== CPU Post-Processing Pipeline Completed ===")
-        logging.info(f"Total batches: {batches_processed}")
-        logging.info(f"Total events written: {stats['total_events_written']}")
-        logging.info(f"Total events filtered: {stats['total_events_filtered']}")
-        logging.info(f"CXI chunks: {stats['chunks_written']}")
-        logging.info(f"Total time: {total_time:.2f}s")
-        logging.info(f"Throughput: {batches_processed/total_time:.1f} batches/s")
+        logger.info("\n=== Processing Complete ===")
+        logger.info(f"Total batches: {batch_count}")
+        logger.info(f"Total events: {total_events}")
+        logger.info(f"Events written: {stats['total_events_written']}")
+        logger.info(f"Events filtered: {stats['total_events_filtered']}")
+        logger.info(f"CXI files: {stats['chunks_written']}")
