@@ -1,83 +1,54 @@
 """
-Peak finding Ray task for CPU-based post-processing.
+Peak finding using scipy.ndimage for CXI post-processing.
 
-This module provides a stateless Ray task that performs peak finding on
-segmentation maps using scipy.ndimage.
+This module provides a plain function (no Ray, no torch) that performs peak finding
+on segmentation logits using connected component labeling and center of mass.
 """
 
-import ray
 import numpy as np
 from scipy import ndimage
-import torch
 
 
-@ray.remote
-def process_samples_task(samples, structure):
+def find_peaks_numpy(logits_2d: np.ndarray, return_seg_map: bool = False):
     """
-    Stateless Ray task for peak finding using scipy.ndimage.
-
-    This task processes a mini-batch of samples, converting logits to segmentation
-    maps and finding peaks using connected component labeling and center of mass
-    calculation.
+    Find peaks from 2-class logits using scipy.ndimage.label.
 
     Args:
-        samples: Mini-batch of sample logits with shape (N, num_classes, H, W).
-                 Note: ObjectRefs are automatically dereferenced by Ray when passed
-                 as top-level arguments to remote functions.
-        structure: Shared 8-connectivity structure for ndimage.label (3x3 array).
-                   Auto-dereferenced from ObjectRef by Ray.
+        logits_2d: (2, H, W) logits from model
+        return_seg_map: If True, return (peaks, seg_map) tuple
 
     Returns:
-        List of peak positions per sample: [[[idx, y, x], ...], ...]
-        where idx is the sample index (local to this mini-batch).
-
-        NOTE: Event/panel grouping is done in coordinator.py using global indices,
-        not here with local mini-batch indices.
-
-    Note:
-        - Ray automatically dereferences ObjectRefs at function boundaries
-        - Performs softmax + argmax to convert logits to binary segmentation
-        - Uses scipy.ndimage.label for connected component labeling
-        - Uses scipy.ndimage.center_of_mass for peak localization
-        - Matches OLD_CXI_DEV_DIR peak finding algorithm
+        peaks: (N, 3) array of [panel_idx=0, y, x]
+        OR
+        (peaks, seg_map): If return_seg_map=True, where seg_map is (H, W) uint8 with values 0 or 1
     """
-    all_peaks = []
+    # Binary segmentation via argmax (class 0=background, class 1=peak)
+    seg_map = np.argmax(logits_2d, axis=0)  # (H, W) with values 0 or 1
 
-    for sample_idx, sample_logits in enumerate(samples):
-        # Stage 1: Logits → Segmentation Map
-        # Input: (num_classes=2, H, W) - class 0=background, class 1=peak
-        # Output: (H, W) binary mask
-        if isinstance(sample_logits, torch.Tensor):
-            seg_map = sample_logits.softmax(dim=0).argmax(dim=0).cpu().numpy()
-        else:
-            # Already numpy array
-            seg_map = sample_logits.argmax(axis=0)
+    peak_mask = (seg_map == 1)
 
-        # Stage 2: Connected Component Labeling
-        # Find distinct peak regions using 8-connectivity
-        labeled_map, num_peaks = ndimage.label(seg_map, structure)
+    # Find connected components (8-connectivity)
+    structure = np.ones((3, 3), dtype=np.float32)
+    labeled, num_features = ndimage.label(peak_mask, structure=structure)
 
-        # Stage 3: Center of Mass for each peak
-        if num_peaks > 0:
-            peak_coords = ndimage.center_of_mass(
-                seg_map.astype(np.float32),
-                labeled_map.astype(np.float32),
-                np.arange(1, num_peaks + 1)
-            )
+    if num_features == 0:
+        peaks = np.array([]).reshape(0, 3)
+    else:
+        # Find center of mass for each component
+        peaks = []
+        for label_id in range(1, num_features + 1):
+            component_mask = labeled == label_id
+            y_coords, x_coords = np.where(component_mask)
 
-            # Convert to [sample_idx, y, x] format
-            # sample_idx is local to this mini-batch - coordinator will handle global grouping
-            peaks = []
-            for coords in peak_coords:
-                if isinstance(coords, tuple) and len(coords) == 2:
-                    y, x = coords
-                    peaks.append([sample_idx, float(y), float(x)])
-                elif isinstance(coords, (list, np.ndarray)) and len(coords) == 2:
-                    y, x = coords
-                    peaks.append([sample_idx, float(y), float(x)])
-        else:
-            peaks = []
+            # Center of mass
+            y_center = y_coords.mean()
+            x_center = x_coords.mean()
 
-        all_peaks.append(peaks)
+            peaks.append([0, y_center, x_center])  # panel_idx=0 for single panel
 
-    return all_peaks
+        peaks = np.array(peaks, dtype=np.float32)
+
+    if return_seg_map:
+        return peaks, seg_map.astype(np.uint8)
+    else:
+        return peaks
