@@ -210,19 +210,6 @@ Ray ObjectStoreFullError: ...
 ```
 Solution: Decrease `max_pending_tasks` or increase Ray object store size
 
-## Citation
-
-If you use this software in your research, please cite:
-
-```
-@software{cxi_pipeline_ray,
-  title = {cxi-pipeline-ray: Ray-based CPU post-processing pipeline for PeakNet inference},
-  author = {Yoon, Chun Hong},
-  year = {2025},
-  url = {https://github.com/...}
-}
-```
-
 ## License
 
 MIT License - see LICENSE file for details
