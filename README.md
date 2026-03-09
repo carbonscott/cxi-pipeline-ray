@@ -230,4 +230,4 @@ MIT License - see LICENSE file for details
 ## Contact
 
 For questions or issues, please contact:
-- Chun Hong Yoon <cxyoon@slac.stanford.edu>
+- Cong Wang <cwang31@slac.stanford.edu>
