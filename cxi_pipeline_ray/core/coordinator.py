@@ -36,9 +36,11 @@ def group_panels_into_events(batch_info):
             - H_orig, W_orig: Original detector dimensions
             - detector_images_4d: (B, C, H, W) detector images
             - photon_energy, timestamp, photon_wavelength: Physics metadata
+            - segmentation_maps: Optional list of (H, W) seg_maps (debug mode)
 
     Returns:
-        (event_images, event_peaks, event_metadata): Tuples for file_writer.submit_processed_batch()
+        (event_images, event_peaks, event_metadata, event_seg_maps): Tuples for file_writer.submit_processed_batch()
+        Note: event_seg_maps can be None if segmentation_maps not provided
     """
     B = batch_info['B']
     C = batch_info['C']
@@ -46,6 +48,7 @@ def group_panels_into_events(batch_info):
     W_orig = batch_info['W_orig']
     detector_images_4d = batch_info['detector_images_4d']
     completed_panels = batch_info['completed_panels']
+    segmentation_maps = batch_info.get('segmentation_maps', None)
 
     # Sort by panel index
     completed_panels.sort(key=lambda x: x[0])
@@ -54,6 +57,7 @@ def group_panels_into_events(batch_info):
     event_images = []
     event_peaks = []
     event_metadata = []
+    event_seg_maps = [] if segmentation_maps is not None else None
 
     for event_idx in range(B):
         panel_start = event_idx * C
@@ -65,6 +69,12 @@ def group_panels_into_events(batch_info):
         else:
             # Fallback: use logits (won't be perfect but better than nothing)
             event_image = None
+
+        # Get segmentation maps for this event: (C, H, W)
+        if segmentation_maps is not None:
+            event_seg_map = np.stack(segmentation_maps[panel_start:panel_end])  # (C, H_orig, W_orig)
+        else:
+            event_seg_map = None
 
         # Combine peaks from all panels for this event
         event_peaks_combined = []
@@ -96,13 +106,13 @@ def group_panels_into_events(batch_info):
             photon_energy = float(photon_energy)
 
         if isinstance(timestamp, (list, np.ndarray)):
-            timestamp = float(timestamp[event_idx]) if len(timestamp) > event_idx else float(timestamp[0])
+            timestamp = int(timestamp[event_idx]) if len(timestamp) > event_idx else int(timestamp[0])
         elif timestamp is not None:
-            timestamp = float(timestamp)
+            timestamp = int(timestamp)
 
         event_meta = {
             'photon_energy': photon_energy if photon_energy is not None else 0.0,
-            'timestamp': timestamp if timestamp is not None else 0.0,
+            'timestamp': timestamp if timestamp is not None else 0,
         }
 
         if photon_wavelength is not None:
@@ -114,8 +124,10 @@ def group_panels_into_events(batch_info):
         event_images.append(event_image)
         event_peaks.append(event_peaks_combined)
         event_metadata.append(event_meta)
+        if event_seg_maps is not None:
+            event_seg_maps.append(event_seg_map)
 
-    return event_images, event_peaks, event_metadata
+    return event_images, event_peaks, event_metadata, event_seg_maps
 
 
 def run_cpu_postprocessing_pipeline(

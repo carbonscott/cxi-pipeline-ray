@@ -253,20 +253,17 @@ class CXIFileWriterActor:
                 f.create_dataset(
                     '/entry_1/result_1/peakSegPosRaw',
                     (num_events, self.max_num_peak),
-                    dtype='float32',
-                    fillvalue=-1
+                    dtype='float32'
                 )
                 f.create_dataset(
                     '/entry_1/result_1/peakXPosRaw',
                     (num_events, self.max_num_peak),
-                    dtype='float32',
-                    fillvalue=-1
+                    dtype='float32'
                 )
                 f.create_dataset(
                     '/entry_1/result_1/peakYPosRaw',
                     (num_events, self.max_num_peak),
-                    dtype='float32',
-                    fillvalue=-1
+                    dtype='float32'
                 )
                 f.create_dataset(
                     '/entry_1/result_1/nPeaks',
@@ -325,13 +322,13 @@ class CXIFileWriterActor:
                     meta = evt['metadata'] if isinstance(evt['metadata'], dict) else {}
                     photon_energies.append(meta.get('photon_energy', 0.0))
 
-                    # Handle timestamp - could be scalar or array
-                    ts = meta.get('timestamp', 0.0)
+                    # Handle timestamp - uint64 with seconds in upper 32 bits,
+                    # nanoseconds in lower 32 bits (matches psana2 format)
+                    ts = meta.get('timestamp', 0)
                     if isinstance(ts, np.ndarray):
-                        # Take first element if array
-                        timestamps.append(float(ts.flatten()[0]) if ts.size > 0 else 0.0)
+                        timestamps.append(int(ts.flatten()[0]) if ts.size > 0 else 0)
                     else:
-                        timestamps.append(float(ts))
+                        timestamps.append(int(ts))
 
                 # Create LCLS metadata datasets
                 f.create_dataset(
@@ -340,9 +337,9 @@ class CXIFileWriterActor:
                 )
 
                 # Add timestamp dataset if any non-zero timestamps exist
-                # Convert to array first to safely check
-                timestamps_array = np.array(timestamps, dtype='float32')
-                if np.any(timestamps_array != 0.0):
+                # uint64 format: upper 32 bits = seconds, lower 32 bits = nanoseconds
+                timestamps_array = np.array(timestamps, dtype='uint64')
+                if np.any(timestamps_array != 0):
                     f.create_dataset(
                         '/LCLS/detector_1/timestamp',
                         data=timestamps_array
